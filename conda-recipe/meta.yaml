@@ -1,0 +1,58 @@
+{% set version = "0.4.0" %}
+
+package:
+  name: mopp2
+  version: {{ version }}
+
+source:
+  path: ..
+
+build:
+  number: 0
+  noarch: python
+  script: {{ PYTHON }} -m pip install . --no-deps --no-build-isolation -vv
+  entry_points:
+    - mopp2 = mopp2.cli:main
+
+requirements:
+  host:
+    - python >=3.9
+    - pip
+    - setuptools >=61
+  run:
+    - python >=3.9
+    - click >=8
+    - trim-galore >=0.6.6
+    - cutadapt
+    - fastqc
+    - pigz
+    - bowtie2 >=2.5
+    - samtools >=1.19
+    - sylph >=0.6.1,<0.7
+    - skani >=0.2.2
+    - prodigal >=2.6.3
+    - eggnog-mapper >=2.1.12
+    - barrnap >=0.9
+    - subread >=2.0
+
+test:
+  imports:
+    - mopp2
+  source_files:
+    - tests
+  requires:
+    - pytest
+  commands:
+    - mopp2 --help
+    - mopp2 trim --help
+    - mopp2 workflow --help
+    - test -f "$(mopp2 scripts-dir)/6_build_features.sh"
+    - pytest -q tests
+
+about:
+  summary: Multi-omics (metaG / metaT / metaRibo-Seq) processing pipeline with per-sample reference databases
+  description: |
+    mopp2 trims metagenomic, metatranscriptomic and metaRibo-Seq reads, builds a
+    reference database per sample from the genomes detected in it, maps every
+    library to its sample's database and produces gene- and genome-level count,
+    TPM and RPKM tables.

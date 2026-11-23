@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mopp2"
+dynamic = ["version"]
+description = "Multi-omics (metaG / metaT / metaRibo-Seq) processing pipeline with per-sample reference databases"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["click>=8"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+mopp2 = "mopp2.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "mopp2.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["mopp2*"]
+
+[tool.setuptools.package-data]
+mopp2 = ["scripts/*.sh"]

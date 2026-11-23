@@ -1,0 +1,30 @@
+# conda env create -f environment.yml && conda activate mopp2 && pip install .
+# Versions are the ones mopp2 v4 was run with; newer ones are untested.
+name: mopp2
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - pip
+  - click>=8
+  - pytest
+  # trim
+  - trim-galore=0.6.10
+  - cutadapt=5.0
+  - fastqc=0.12.1
+  - pigz
+  # host-deplete, subdb, map
+  - bowtie2=2.5.4
+  - samtools>=1.19
+  - sylph=0.6.1
+  - skani=0.2.2
+  # annotate, blacklist
+  - prodigal=2.6.3
+  - eggnog-mapper=2.1.12
+  - diamond>=2.1.8
+  - barrnap=0.9
+  # features
+  - subread>=2.1.1
+  # checkm2 is optional (3c uses it to score MAGs; without it GlobDB genomes
+  # get quality_score=70). Install it in its own env if you need it.
