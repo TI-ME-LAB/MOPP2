@@ -9,11 +9,14 @@ detected in that sample, and every library is mapped to its sample's database. T
 result is a set of gene- and genome-level count, TPM and RPKM tables for each
 omic.
 
-There are two typical use cases:
+There are three typical use cases:
 
 (1) To run every step from one config file, run `mopp2 workflow --help`
 
 (2) To run a single step, run `mopp2 trim --help`, `mopp2 map --help`, etc.
+
+(3) To run the same chain under Snakemake, see
+[Running mopp2 with Snakemake](#running-mopp2-with-snakemake)
 
 ```
 mopp2 metadata      create / validate the sample metadata
@@ -389,6 +392,76 @@ per genome, and genome TPM and RPKM are normalized by genome length (from
 total CDS length, if you need a different normalization.
 
 ***
+<h2> <p align="center"> Running mopp2 with Snakemake </p> </h2>
+
+The repository ships a Snakemake workflow that drives the same `mopp2` commands:
+`workflow/Snakefile`, with an example configuration in
+[`config/config.yaml`](config/config.yaml). Use it instead of `mopp2 workflow`
+when you want the trimming distributed over a cluster, or Snakemake's own
+bookkeeping (`-n`, `--dag`, `--report`, job scheduling, profiles).
+
+```bash
+conda activate mopp2
+conda install -c conda-forge -c bioconda snakemake-minimal   # once
+
+cp config/config.yaml myconfig.yaml
+$EDITOR myconfig.yaml            # mopp2_config, subdb_mode, rawdir, metadata
+
+snakemake -s workflow/Snakefile --configfile myconfig.yaml -c 24 -n   # dry run
+snakemake -s workflow/Snakefile --configfile myconfig.yaml -c 24
+```
+
+Snakemake is run from the environment mopp2 is installed in: every rule is a
+`mopp2` command, and mopp2 brings its own tools, so `--use-conda` is not needed.
+
+The configuration keys:
+
+| key | |
+|---|---|
+| `mopp2_config` | the bash config from `mopp2 init-config`. `PROJECT`, `TRIM_DIR`, `SUBDB_ROOT`, `MAPPING_OUT` and `FEATURES_OUT` are read from it |
+| `subdb_mode` | `curated`, `reuse` or `globdb` |
+| `rawdir`, `metadata` | set both to trim as part of the workflow; leave both out to start from reads that are already in `TRIM_DIR` |
+| `trim_dir` | overrides `TRIM_DIR` from the bash config |
+| `trim` | `fastqc`, `min_length`, `metars_min_length`, `metars_max_length` |
+| `host_depletion` | run `mopp2 host-deplete` between trim and subdb |
+| `saf_args` | extra arguments for `mopp2 saf`, e.g. `"--mode rebuild"` |
+| `conda_switch` | let the step scripts `conda activate` the envs named in the bash config |
+| `threads` | per rule: `trim`, `host_deplete`, `subdb`, `map`, `annotate`, `blacklist`, `saf`, `features` |
+
+How the rules are cut up:
+
+- **trim** is one job per library (`trim_paired` / `trim_single`), so N libraries
+  trim at the same time and `-c` caps the total. Each one runs in
+  `<TRIM_DIR>/per_library/<identifier>.<omic>/` and moves its reads into
+  `TRIM_DIR` afterwards; two libraries would otherwise both write
+  `TRIM_DIR/trim_summary.tsv`. `trim_done` merges the per-library summaries
+  back into that one file. The per-library directories are left behind: they
+  hold the metadata subset and mopp2's own log for that library.
+- **Every later step** is a single cohort-wide job, because the step scripts
+  loop over the samples themselves.
+- Those cohort steps also **resume themselves**, skipping the samples they
+  already finished. Their rules therefore declare nothing but a flag file under
+  `$PROJECT/.mopp2/flags/` as output. A failed step loses its flag and nothing
+  else, so the next run picks the work up where it stopped — if real output
+  files were declared, Snakemake would delete the half-finished ones. To force a
+  step to run again, delete its flag. Per-step logs are in `$PROJECT/.mopp2/logs/`.
+
+Useful targets and options:
+
+```bash
+snakemake -s workflow/Snakefile --configfile myconfig.yaml -c 24 --until subdb   # stop after subdb
+snakemake -s workflow/Snakefile --configfile myconfig.yaml -c 24 trim_all        # trim only
+snakemake -s workflow/Snakefile --configfile myconfig.yaml --dag | dot -Tpdf > dag.pdf
+```
+
+On a cluster, [`workflow/profiles/slurm/config.yaml`](workflow/profiles/slurm/config.yaml)
+is a starting point (placeholder partition, account and memory):
+
+```bash
+conda install -c conda-forge -c bioconda snakemake-executor-plugin-slurm
+snakemake -s workflow/Snakefile --configfile myconfig.yaml --profile workflow/profiles/slurm
+```
+
 <h2> <p align="center"> Running the scripts without the mopp2 command </h2>
 
 Each step is a bash script in `mopp2/scripts/` (`mopp2 scripts-dir` prints the

@@ -1,0 +1,410 @@
+# mopp2 Snakemake workflow
+#
+#   snakemake -s workflow/Snakefile --configfile config/config.yaml -c 24
+#
+# Run it from an environment where `mopp2` is on PATH (the conda env mopp2 was
+# installed into). The workflow does not create conda envs of its own: every
+# step is the `mopp2` command, and mopp2 brings its own tools.
+#
+# What each rule does
+# -------------------
+# trim is split per library, so Snakemake (or a cluster) can run the libraries
+# in parallel. Every later step is a cohort-wide mopp2 command that loops over
+# the samples itself, so it is one rule with one job.
+#
+# Those cohort steps resume themselves: each one skips the samples it already
+# finished. Their rules therefore declare only a flag file under
+# $PROJECT/.mopp2/flags/ as output - if the step fails, Snakemake removes the
+# flag and nothing else, and the next run picks the work up where it stopped.
+# Delete a flag by hand to force a step to run again.
+
+import csv
+import re
+import subprocess
+from collections import defaultdict
+from pathlib import Path
+
+
+# --------------------------------------------------------------------- config
+if not config:
+    raise WorkflowError("no config given: snakemake --configfile config/config.yaml ...")
+
+
+def _cfg(key, default=None, required=False):
+    val = config.get(key, default)
+    if required and val in (None, ""):
+        raise WorkflowError(f"config key '{key}' is required")
+    return val
+
+
+MOPP2_CONFIG = Path(_cfg("mopp2_config", required=True)).resolve()
+if not MOPP2_CONFIG.is_file():
+    raise WorkflowError(f"mopp2_config not found: {MOPP2_CONFIG}")
+
+SUBDB_MODE = _cfg("subdb_mode", required=True)
+if SUBDB_MODE not in ("curated", "reuse", "globdb"):
+    raise WorkflowError(f"subdb_mode must be curated, reuse or globdb (got {SUBDB_MODE!r})")
+
+HOST_DEPLETION = bool(_cfg("host_depletion", False))
+SAF_ARGS = _cfg("saf_args", "")
+TRIM_CFG = _cfg("trim", {}) or {}
+THREADS = _cfg("threads", {}) or {}
+
+RAWDIR = _cfg("rawdir")
+METADATA = _cfg("metadata")
+RUN_TRIM = bool(RAWDIR and METADATA)
+if bool(RAWDIR) != bool(METADATA):
+    raise WorkflowError("set both 'rawdir' and 'metadata' to run trim, or neither to start "
+                        "from reads that are already trimmed")
+
+MOPP2 = "mopp2 --conda-switch" if _cfg("conda_switch", False) else "mopp2"
+
+
+# ------------------------------------------------- values from the bash config
+def bash_vars(config_sh, names):
+    """Value of each name after sourcing the mopp2 bash config ('' when unset)."""
+    script = ('set +u; source "$1" >/dev/null 2>&1 || exit 3; shift; '
+              'for v in "$@"; do printf "%s\\n" "${!v}"; done')
+    proc = subprocess.run(["bash", "-c", script, "_", str(config_sh), *names],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise WorkflowError(f"could not source {config_sh}:\n{proc.stderr.strip()}")
+    return dict(zip(names, proc.stdout.split("\n")))
+
+
+_V = bash_vars(MOPP2_CONFIG, ["PROJECT", "TRIM_DIR", "HF_OUT", "READS_DIR",
+                              "SUBDB_ROOT", "MAPPING_OUT", "FEATURES_OUT"])
+
+PROJECT = _V["PROJECT"]
+if not PROJECT:
+    raise WorkflowError(f"PROJECT is not set in {MOPP2_CONFIG}")
+TRIM_DIR = Path(_cfg("trim_dir") or _V["TRIM_DIR"] or f"{PROJECT}/2.trim")
+FLAGS = Path(PROJECT) / ".mopp2" / "flags"
+LOGS = Path(PROJECT) / ".mopp2" / "logs"
+
+
+# ------------------------------------------------------------------- libraries
+# One trim job per (identifier, omic). Paired when the metadata has an r2 row.
+LIBS = {}        # (identifier, omic) -> {"paired": bool, "files": [raw file names]}
+
+if RUN_TRIM:
+    RAWDIR = Path(RAWDIR).resolve()
+    METADATA = Path(METADATA).resolve()
+    rows = defaultdict(list)
+    with open(METADATA, newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        need = {"sample_name", "identifier", "omic", "strand"}
+        if not need.issubset(reader.fieldnames or []):
+            raise WorkflowError(f"{METADATA}: expected columns {sorted(need)}, "
+                                f"found {reader.fieldnames}")
+        for row in reader:
+            if not row.get("identifier"):
+                continue
+            rows[(row["identifier"].strip(), row["omic"].strip())].append(row)
+    for key, rs in rows.items():
+        strands = {r["strand"].strip().lower() for r in rs}
+        LIBS[key] = {
+            "paired": "r2" in strands,
+            "files": [r["sample_name"].strip() for r in rs],
+        }
+    if not LIBS:
+        raise WorkflowError(f"{METADATA} lists no libraries")
+
+IDENTS = sorted({i for i, _ in LIBS})
+OMICS = sorted({o for _, o in LIBS})
+
+
+wildcard_constraints:
+    ident="|".join(re.escape(i) for i in IDENTS) if IDENTS else "$^",
+    omic="|".join(re.escape(o) for o in OMICS) if OMICS else "$^",
+
+
+def lib_outputs(ident, omic):
+    """The files `mopp2 trim` writes for one library (see mopp2/trim.py)."""
+    base = f"{ident}_{omic}"
+    if LIBS[(ident, omic)]["paired"]:
+        return [TRIM_DIR / f"{base}_R1.fq.gz", TRIM_DIR / f"{base}_R2.fq.gz"]
+    return [TRIM_DIR / f"{base}.fq.gz"]
+
+
+ALL_TRIMMED = [f for key in LIBS for f in lib_outputs(*key)]
+LIB_SUMMARIES = [
+    TRIM_DIR / "trimming_reports"
+    / f"trim_summary.{i}.{o}.{'pe' if LIBS[(i, o)]['paired'] else 'se'}.tsv"
+    for i, o in LIBS
+]
+
+
+def threads_for(step, default):
+    return int(THREADS.get(step, default))
+
+
+def flag(step):
+    return str(FLAGS / f"{step}.done")
+
+
+def after_trim():
+    """What the first cohort-wide step waits for."""
+    return [str(FLAGS / "trim.done")] if RUN_TRIM else []
+
+
+# ------------------------------------------------------------------ trim body
+# Each library is trimmed in a directory of its own and the reads are then
+# moved into TRIM_DIR: two libraries trimmed at the same time would otherwise
+# both write TRIM_DIR/trim_summary.tsv.
+TRIM_OPTS = " ".join(x for x in [
+    "" if TRIM_CFG.get("fastqc", True) else "--no-fastqc",
+    f"--min-length {TRIM_CFG['min_length']}" if "min_length" in TRIM_CFG else "",
+    f"--metars-min-length {TRIM_CFG['metars_min_length']}" if "metars_min_length" in TRIM_CFG else "",
+    f"--metars-max-length {TRIM_CFG['metars_max_length']}" if "metars_max_length" in TRIM_CFG else "",
+] if x)
+
+
+def trim_workdir(wc):
+    return str(TRIM_DIR / "per_library" / f"{wc.ident}.{wc.omic}")
+
+
+TRIM_SHELL = r"""
+set -euo pipefail
+rm -rf {params.workdir:q}
+mkdir -p {params.workdir:q} {params.trimdir:q}/trimming_reports
+md={params.workdir:q}/metadata.tsv
+head -n 1 {input.metadata:q} > "$md"
+awk -F'\t' -v id={wildcards.ident:q} -v om={wildcards.omic:q} \
+    'NR>1 && $2==id && $3==om' {input.metadata:q} >> "$md"
+
+{params.mopp2} trim \
+    -i {params.rawdir:q} -o {params.workdir:q} -m "$md" \
+    -t 1 --cores-per-job {threads} {params.opts} > {log:q} 2>&1
+
+# reads -> TRIM_DIR, reports -> TRIM_DIR/trimming_reports, summary per library
+for f in {params.workdir:q}/*.fq.gz; do mv -f "$f" {params.trimdir:q}/; done
+if [ -d {params.workdir:q}/trimming_reports ]; then
+    cp -a {params.workdir:q}/trimming_reports/. {params.trimdir:q}/trimming_reports/
+fi
+mv -f {params.workdir:q}/trim_summary.tsv {output.summary:q}
+"""
+
+
+# ------------------------------------------------------------------- targets
+rule all:
+    input:
+        flag("features"),
+
+
+rule trim_all:
+    input:
+        str(FLAGS / "trim.done"),
+
+
+localrules: all, trim_all, trim_done
+
+
+# ---------------------------------------------------------------------- trim
+# Each library is trimmed in a directory of its own and the reads are then moved
+# into TRIM_DIR. Two libraries trimmed at the same time would otherwise both
+# write TRIM_DIR/trim_summary.tsv.
+rule trim_paired:
+    input:
+        metadata=lambda wc: str(METADATA),
+        reads=lambda wc: [str(RAWDIR / f) for f in LIBS[(wc.ident, wc.omic)]["files"]],
+    output:
+        r1=str(TRIM_DIR / "{ident}_{omic}_R1.fq.gz"),
+        r2=str(TRIM_DIR / "{ident}_{omic}_R2.fq.gz"),
+        summary=str(TRIM_DIR / "trimming_reports" / "trim_summary.{ident}.{omic}.pe.tsv"),
+    params:
+        mopp2=MOPP2,
+        rawdir=str(RAWDIR) if RUN_TRIM else "",
+        trimdir=str(TRIM_DIR),
+        workdir=trim_workdir,
+        opts=TRIM_OPTS,
+    threads: threads_for("trim", 4)
+    log:
+        str(LOGS / "trim.{ident}.{omic}.log"),
+    shell:
+        TRIM_SHELL
+
+
+rule trim_single:
+    input:
+        metadata=lambda wc: str(METADATA),
+        reads=lambda wc: [str(RAWDIR / f) for f in LIBS[(wc.ident, wc.omic)]["files"]],
+    output:
+        se=str(TRIM_DIR / "{ident}_{omic}.fq.gz"),
+        summary=str(TRIM_DIR / "trimming_reports" / "trim_summary.{ident}.{omic}.se.tsv"),
+    params:
+        mopp2=MOPP2,
+        rawdir=str(RAWDIR) if RUN_TRIM else "",
+        trimdir=str(TRIM_DIR),
+        workdir=trim_workdir,
+        opts=TRIM_OPTS,
+    threads: threads_for("trim", 4)
+    log:
+        str(LOGS / "trim.{ident}.{omic}.log"),
+    shell:
+        TRIM_SHELL
+
+
+rule trim_done:
+    """One trim_summary.tsv for the cohort, and the flag the next step waits for."""
+    input:
+        summaries=[str(p) for p in LIB_SUMMARIES],
+        reads=[str(p) for p in ALL_TRIMMED],
+    output:
+        summary=str(TRIM_DIR / "trim_summary.tsv"),
+        flag=str(FLAGS / "trim.done"),
+    shell:
+        r"""
+        set -euo pipefail
+        : > {output.summary:q}
+        first=1
+        for f in {input.summaries:q}; do
+            if [ "$first" = 1 ]; then head -n 1 "$f" >> {output.summary:q}; first=0; fi
+            tail -n +2 "$f" >> {output.summary:q}
+        done
+        date -Is > {output.flag:q}
+        """
+
+
+# ------------------------------------------------------------- cohort steps
+rule host_deplete:
+    input:
+        after_trim(),
+    output:
+        flag("host-deplete"),
+    params:
+        mopp2=MOPP2,
+        config=str(MOPP2_CONFIG),
+    threads: threads_for("host_deplete", 24)
+    log:
+        str(LOGS / "host_deplete.log"),
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output:q})"
+        {params.mopp2} host-deplete {params.config:q} > {log:q} 2>&1
+        date -Is > {output:q}
+        """
+
+
+def reads_ready():
+    """subdb and map read the host-depleted reads when host depletion is on."""
+    return [flag("host-deplete")] if HOST_DEPLETION else after_trim()
+
+
+rule subdb:
+    input:
+        reads_ready(),
+    output:
+        flag("subdb"),
+    params:
+        mopp2=MOPP2,
+        config=str(MOPP2_CONFIG),
+        mode=SUBDB_MODE,
+    threads: threads_for("subdb", 24)
+    log:
+        str(LOGS / "subdb.log"),
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output:q})"
+        {params.mopp2} subdb {params.config:q} --mode {params.mode} > {log:q} 2>&1
+        date -Is > {output:q}
+        """
+
+
+rule map:
+    input:
+        flag("subdb"),
+    output:
+        flag("map"),
+    params:
+        mopp2=MOPP2,
+        config=str(MOPP2_CONFIG),
+    threads: threads_for("map", 24)
+    log:
+        str(LOGS / "map.log"),
+    shell:
+        r"""
+        set -euo pipefail
+        {params.mopp2} map {params.config:q} > {log:q} 2>&1
+        date -Is > {output:q}
+        """
+
+
+rule annotate:
+    input:
+        flag("subdb"),
+    output:
+        flag("annotate"),
+    params:
+        mopp2=MOPP2,
+        config=str(MOPP2_CONFIG),
+    threads: threads_for("annotate", 24)
+    log:
+        str(LOGS / "annotate.log"),
+    shell:
+        r"""
+        set -euo pipefail
+        {params.mopp2} annotate {params.config:q} > {log:q} 2>&1
+        date -Is > {output:q}
+        """
+
+
+rule blacklist:
+    input:
+        flag("annotate"),
+    output:
+        flag("blacklist"),
+    params:
+        mopp2=MOPP2,
+        config=str(MOPP2_CONFIG),
+    threads: threads_for("blacklist", 24)
+    log:
+        str(LOGS / "blacklist.log"),
+    shell:
+        r"""
+        set -euo pipefail
+        {params.mopp2} blacklist {params.config:q} > {log:q} 2>&1
+        date -Is > {output:q}
+        """
+
+
+rule saf:
+    input:
+        flag("blacklist"),
+    output:
+        flag("saf"),
+    params:
+        mopp2=MOPP2,
+        config=str(MOPP2_CONFIG),
+        extra=SAF_ARGS,
+    threads: threads_for("saf", 1)
+    log:
+        str(LOGS / "saf.log"),
+    shell:
+        r"""
+        set -euo pipefail
+        {params.mopp2} saf {params.config:q} {params.extra} > {log:q} 2>&1
+        date -Is > {output:q}
+        """
+
+
+rule features:
+    input:
+        flag("map"),
+        flag("saf"),
+    output:
+        flag("features"),
+    params:
+        mopp2=MOPP2,
+        config=str(MOPP2_CONFIG),
+    threads: threads_for("features", 24)
+    log:
+        str(LOGS / "features.log"),
+    shell:
+        r"""
+        set -euo pipefail
+        {params.mopp2} features {params.config:q} > {log:q} 2>&1
+        date -Is > {output:q}
+        """

@@ -1,0 +1,53 @@
+# mopp2 Snakemake configuration
+#
+#   snakemake -s workflow/Snakefile --configfile config/config.yaml -c 24 -n
+#
+# Paths are relative to the directory snakemake is started in.
+
+# ---------------------------------------------------------------- required ---
+# The mopp2 bash config (`mopp2 init-config -o myproject.config.sh`). Every step
+# after trim reads it, and the workflow takes PROJECT, TRIM_DIR, SUBDB_ROOT,
+# MAPPING_OUT and FEATURES_OUT from it.
+mopp2_config: config/myproject.config.sh
+
+# Which sub-DB builder to run: curated | reuse | globdb (see `mopp2 subdb -h`).
+subdb_mode: globdb
+
+# ---------------------------------------------------------------- trimming ---
+# Set both to run trim as part of the workflow, or comment both out to start
+# from reads that are already in TRIM_DIR.
+rawdir: /path/to/rawdata
+metadata: config/metadata.tsv
+
+# Where the trimmed reads go. Leave it out to use TRIM_DIR from the bash config.
+#trim_dir: /path/to/project/2.trim
+
+trim:
+  fastqc: true
+  #min_length: 20           # metaG / metaT
+  #metars_min_length: 18
+  #metars_max_length: 75
+
+# ---------------------------------------------------------------- optional ---
+# Remove host reads between trim and subdb. For host-associated samples only
+# (stool, skin, plant tissue); needs HUMAN_IDX in the bash config.
+host_depletion: false
+
+# Extra arguments for `mopp2 saf`, e.g. "--mode rebuild".
+saf_args: ""
+
+# Let the step scripts `conda activate` the envs named in the bash config.
+# Off by default: every tool comes from the environment mopp2 is installed in.
+conda_switch: false
+
+# Threads per job. trim is per library, so N libraries can run at once and
+# `snakemake -c` caps the total; the other steps are one job over the cohort.
+threads:
+  trim: 4
+  host_deplete: 24
+  subdb: 24
+  map: 24
+  annotate: 24
+  blacklist: 24
+  saf: 1
+  features: 24

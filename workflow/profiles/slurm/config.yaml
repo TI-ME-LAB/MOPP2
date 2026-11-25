@@ -1,0 +1,49 @@
+# Example Snakemake profile for a SLURM cluster.
+#
+#   conda install -c conda-forge -c bioconda snakemake-executor-plugin-slurm
+#   snakemake -s workflow/Snakefile --configfile config/config.yaml \
+#             --profile workflow/profiles/slurm
+#
+# Adjust the partition, the account and the memory before using it: the values
+# below are placeholders. Walltimes are in minutes.
+executor: slurm
+jobs: 20
+latency-wait: 60
+rerun-incomplete: true
+printshellcmds: true
+
+default-resources:
+  slurm_partition: "compute"
+  #slurm_account: "your-account"
+  runtime: 240
+  mem_mb: 16000
+
+set-resources:
+  trim_paired:
+    runtime: 240
+    mem_mb: 16000
+  trim_single:
+    runtime: 240
+    mem_mb: 16000
+  host_deplete:
+    runtime: 1440
+    mem_mb: 32000
+  subdb:
+    runtime: 2880
+    mem_mb: 128000
+  map:
+    runtime: 2880
+    mem_mb: 64000
+  annotate:
+    # eggNOG-mapper on a large pool runs for days; raise this if it is cut off.
+    runtime: 5760
+    mem_mb: 128000
+  blacklist:
+    runtime: 1440
+    mem_mb: 32000
+  saf:
+    runtime: 120
+    mem_mb: 8000
+  features:
+    runtime: 2880
+    mem_mb: 64000
